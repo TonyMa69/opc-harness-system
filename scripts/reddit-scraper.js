@@ -1,12 +1,12 @@
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
+const { chromium } = require('playwright');
 const config = require('../config/reddit-config');
 
-async function fetchPostsWithRetry(subreddit, retries = 3) {
+async function fetchPostsWithRetry(subreddit, browser, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const result = await fetchPosts(subreddit);
+      const result = await fetchPosts(subreddit, browser);
       if (result.length > 0 || attempt === retries) {
         return result;
       }
@@ -22,62 +22,49 @@ async function fetchPostsWithRetry(subreddit, retries = 3) {
   return [];
 }
 
-function fetchPosts(subreddit) {
-  return new Promise((resolve, reject) => {
+async function fetchPosts(subreddit, browser) {
+  const page = await browser.newPage({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+  });
+  
+  try {
     const url = `https://www.reddit.com/r/${subreddit}/hot.json?limit=${config.postsPerSubreddit}`;
     
-    const options = {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      },
+    await page.goto(url, {
+      waitUntil: 'networkidle',
       timeout: 30000
-    };
-    
-    const req = https.get(url, options, (res) => {
-      let data = '';
-      
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
-      
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          const posts = json.data.children.map(child => ({
-            postId: child.data.id,
-            subreddit: child.data.subreddit,
-            title: child.data.title,
-            content: child.data.selftext || '',
-            score: child.data.score,
-            comments: child.data.num_comments,
-            url: `https://www.reddit.com${child.data.permalink}`,
-            postedDate: new Date(child.data.created_utc * 1000).toISOString(),
-            author: child.data.author,
-            flair: child.data.link_flair_text || ''
-          }));
-          
-          console.log(`Fetched ${posts.length} posts from r/${subreddit}`);
-          resolve(posts);
-        } catch (error) {
-          console.error(`Error parsing r/${subreddit}: ${error.message}`);
-          console.error(`Response snippet: ${data.substring(0, 500)}`);
-          resolve([]);
-        }
-      });
     });
     
-    req.on('error', (error) => {
-      reject(error);
-    });
+    const content = await page.content();
     
-    req.on('timeout', () => {
-      console.error(`Timeout fetching r/${subreddit}`);
-      req.destroy();
-      reject(new Error('timeout'));
-    });
+    if (!content.startsWith('{')) {
+      console.error(`r/${subreddit} returned non-JSON content`);
+      await page.close();
+      return [];
+    }
     
-    req.end();
-  });
+    const json = JSON.parse(content);
+    const posts = json.data.children.map(child => ({
+      postId: child.data.id,
+      subreddit: child.data.subreddit,
+      title: child.data.title,
+      content: child.data.selftext || '',
+      score: child.data.score,
+      comments: child.data.num_comments,
+      url: `https://www.reddit.com${child.data.permalink}`,
+      postedDate: new Date(child.data.created_utc * 1000).toISOString(),
+      author: child.data.author,
+      flair: child.data.link_flair_text || ''
+    }));
+    
+    console.log(`Fetched ${posts.length} posts from r/${subreddit}`);
+    await page.close();
+    return posts;
+  } catch (error) {
+    console.error(`Error fetching r/${subreddit}: ${error.message}`);
+    await page.close();
+    return [];
+  }
 }
 
 function saveToCSV(posts, filename) {
@@ -107,17 +94,24 @@ function saveToCSV(posts, filename) {
 }
 
 async function run() {
-  console.log('Starting Reddit scraper...');
+  console.log('Starting Reddit scraper (Playwright)...');
   console.log(`Scraping ${config.subreddits.length} subreddits, ${config.postsPerSubreddit} posts each`);
   console.log('');
+  
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
   
   let allPosts = [];
   
   for (const subreddit of config.subreddits) {
-    const posts = await fetchPostsWithRetry(subreddit);
+    const posts = await fetchPostsWithRetry(subreddit, browser);
     allPosts = allPosts.concat(posts);
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
+  
+  await browser.close();
   
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   saveToCSV(allPosts, `raw-posts-${timestamp}.csv`);
@@ -127,7 +121,7 @@ async function run() {
   
   if (allPosts.length === 0) {
     console.log('');
-    console.log('⚠️  No posts were fetched. This could be due to network restrictions.');
+    console.log('⚠️  No posts were fetched.');
   }
 }
 
